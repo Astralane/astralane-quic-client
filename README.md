@@ -4,7 +4,7 @@ Rust client library for sending Solana transactions to Astralane's QUIC TPU endp
 
 ### How It Works
 
-The client authenticates using a self-signed TLS certificate with your API key as the Common Name (CN). On connect, the server extracts the CN from the certificate to identify your account. Transactions are sent as fire-and-forget over QUIC unidirectional streams  - one stream per transaction.
+The client authenticates using a self-signed TLS certificate with your API key as the Common Name (CN). On connect, the server extracts the CN from the certificate to identify your account. Transactions are sent over QUIC unidirectional streams  - one stream per transaction - and each send waits for the server to acknowledge the bytes before reporting success.
 
 ### Installation
 
@@ -33,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
     let transaction: solana_sdk::transaction::VersionedTransaction = /* ... */;
     let tx_bytes = bincode::serialize(&transaction)?;
 
-    // Send (fire-and-forget)
+    // Returns once Astralane has acknowledged the transaction
     client.send_transaction(&tx_bytes).await?;
 
     Ok(())
@@ -50,7 +50,9 @@ Internally generates an EC P-256 self-signed certificate with `api_key` as the C
 
 **`client.send_transaction(&tx_bytes)`**
 
-Sends a bincode-serialized `VersionedTransaction` (max 1232 bytes). Opens a unidirectional QUIC stream, writes the bytes, and finishes the stream. Fire-and-forget  - returns `Ok(())` once written, with no server response.
+Sends a bincode-serialized `VersionedTransaction` (max 1232 bytes). Opens a unidirectional QUIC stream, writes the bytes, finishes the stream, and waits for the server to acknowledge them. Returns `Ok(())` once Astralane has received the transaction — there is no application-level response, so `Ok` means received, not landed on chain.
+
+The acknowledgement costs one round trip but does not delay transmission: the bytes go out immediately and only the returned future waits. To send a batch without paying that round trip serially, drive the calls concurrently (e.g. `join_all`) instead of awaiting them one at a time.
 
 **Automatic reconnection**: If the connection is dead (idle timeout, server restart, etc.), `send_transaction` will transparently reconnect before sending. No manual intervention needed.
 
@@ -64,14 +66,9 @@ Returns `true` if the connection is still alive.
 
 **`client.close().await`**
 
-Gracefully closes the connection. Also called automatically on drop.
+Gracefully closes the connection and waits for the endpoint to flush. Safe to call the moment your last `send_transaction` returns: every transaction it acknowledged is already on the server, so closing cannot lose one. No sleep required.
 
-**Important:** `close()` sends a QUIC `CONNECTION_CLOSE` frame that immediately terminates all open streams. If you've just sent transactions, add a short delay before closing to let the server finish reading in-flight streams:
-
-```rust
-tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-client.close().await;
-```
+Still called automatically on drop, as a best-effort fallback — but `drop` cannot wait for the endpoint to flush, so prefer `close().await` when you control the shutdown.
 
 ### Current Server Limits
 
