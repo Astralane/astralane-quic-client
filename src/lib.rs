@@ -121,8 +121,15 @@ impl AstralaneQuicClient {
 
     /// Send a single bincode-serialized `VersionedTransaction`.
     ///
-    /// This is fire-and-forget: returns `Ok(())` when the bytes are written to the stream.
-    /// There is no server response. Automatically reconnects if the connection is dead.
+    /// Returns `Ok(())` once the server has acknowledged every byte of the transaction.
+    /// There is no application-level response — an `Ok` means Astralane received the
+    /// transaction, not that it landed on chain. Automatically reconnects if the
+    /// connection is dead.
+    ///
+    /// The acknowledgement costs one round trip, but it does not delay transmission:
+    /// the bytes go out immediately and only the returned future waits. To send a
+    /// batch without paying that round trip serially, drive the calls concurrently
+    /// (e.g. `join_all`) rather than awaiting them one at a time.
     ///
     /// # Arguments
     /// * `transaction_bytes` - Bincode-serialized `VersionedTransaction` (max 1232 bytes)
@@ -231,7 +238,25 @@ impl AstralaneQuicClient {
             .context("Failed to write transaction data")?;
 
         send_stream.finish().context("Failed to finish stream")?;
-        info!("[CLIENT] Transaction sent ({} bytes)", transaction_bytes.len());
+
+        // `write_all` only buffers, and `finish` only queues the FIN — neither puts
+        // a byte on the wire. Returning here would report success for a transaction
+        // that a subsequent `close()`, or simply exiting, is free to discard.
+        // `stopped` resolves once the server has acknowledged every byte.
+        match send_stream.stopped().await {
+            Ok(None) => {}
+            Ok(Some(code)) => {
+                anyhow::bail!("Server discarded the transaction (stream stopped, code {code})")
+            }
+            Err(e) => {
+                return Err(e).context("Server never acknowledged the transaction");
+            }
+        }
+
+        info!(
+            "[CLIENT] Transaction delivered ({} bytes)",
+            transaction_bytes.len()
+        );
 
         Ok(())
     }
@@ -261,11 +286,19 @@ impl AstralaneQuicClient {
     }
 
     /// Close the connection gracefully.
+    ///
+    /// Every transaction that `send_transaction` returned `Ok` for has already been
+    /// acknowledged by the server, so closing here cannot lose one.
     pub async fn close(&self) {
         self.connection
             .lock()
             .await
             .close(error_code::OK.into(), b"client closing");
+
+        // Give the CONNECTION_CLOSE frame a chance to actually leave the socket.
+        // Dropping the endpoint kills its driver task, and anything still queued —
+        // including retransmits — dies with it.
+        self.endpoint.wait_idle().await;
     }
 
     /// Build a quinn ClientConfig with a self-signed cert where CN = api_key.
@@ -307,6 +340,11 @@ impl AstralaneQuicClient {
 
 impl Drop for AstralaneQuicClient {
     fn drop(&mut self) {
+        // Best-effort: `drop` cannot await, so it can send CONNECTION_CLOSE but cannot
+        // wait for the endpoint to flush it. That is safe only because every
+        // transaction `send_transaction` acknowledged is already on the server —
+        // prefer `close().await`, which also waits for the endpoint to go idle.
+        //
         // get_mut() avoids async lock — safe in Drop since we have &mut self
         self.connection
             .get_mut()

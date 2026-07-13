@@ -89,12 +89,10 @@ async fn main() -> anyhow::Result<()> {
     );
 
     match client.send_transaction(&tx_bytes).await {
-        Ok(_) => info!("[CLIENT] Transaction sent successfully! sig={}", sig),
+        Ok(_) => info!("[CLIENT] Transaction delivered to Astralane! sig={}", sig),
         Err(e) => tracing::error!("[CLIENT] Failed to send transaction: {:?}", e),
     }
 
-    // Allow server to finish reading the stream before closing
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     client.close().await;
     info!("Done!");
     Ok(())
