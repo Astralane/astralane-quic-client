@@ -58,6 +58,13 @@ fn validate_transaction_size(transaction_bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn ghost_frame(tip_lamports: u64, transaction_bytes: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(8 + transaction_bytes.len());
+    frame.extend_from_slice(&tip_lamports.to_le_bytes());
+    frame.extend_from_slice(transaction_bytes);
+    frame
+}
+
 /// QUIC application error codes returned by the server.
 pub mod error_code {
     pub const OK: u32 = 0;
@@ -169,7 +176,24 @@ impl AstralaneQuicClient {
     /// * `transaction_bytes` - Solana wire bytes (1,232 bytes for legacy/v0; 4,096 for v1)
     pub async fn send_transaction(&self, transaction_bytes: &[u8]) -> Result<()> {
         validate_transaction_size(transaction_bytes)?;
+        self.send_frame(transaction_bytes).await
+    }
 
+    /// Send a Ghost transaction frame with an out-of-band tip prefix.
+    ///
+    /// The transaction bytes are validated before the 8-byte little-endian tip is prepended, so
+    /// a v1 transaction may use the full 4,096-byte protocol limit.
+    pub async fn send_ghost_transaction(
+        &self,
+        tip_lamports: u64,
+        transaction_bytes: &[u8],
+    ) -> Result<()> {
+        validate_transaction_size(transaction_bytes)?;
+        let frame = ghost_frame(tip_lamports, transaction_bytes);
+        self.send_frame(&frame).await
+    }
+
+    async fn send_frame(&self, frame: &[u8]) -> Result<()> {
         // Get the current connection, reconnecting if dead
         let conn = {
             let mut guard = self.connection.lock().await;
@@ -256,25 +280,19 @@ impl AstralaneQuicClient {
             guard.clone()
         };
 
-        info!(
-            "[CLIENT] Opening uni stream to send {} bytes",
-            transaction_bytes.len()
-        );
+        info!("[CLIENT] Opening uni stream to send {} bytes", frame.len());
         let mut send_stream = conn
             .open_uni()
             .await
             .context("Failed to open unidirectional stream")?;
 
         send_stream
-            .write_all(transaction_bytes)
+            .write_all(frame)
             .await
             .context("Failed to write transaction data")?;
 
         send_stream.finish().context("Failed to finish stream")?;
-        info!(
-            "[CLIENT] Transaction sent ({} bytes)",
-            transaction_bytes.len()
-        );
+        info!("[CLIENT] Transaction frame sent ({} bytes)", frame.len());
 
         Ok(())
     }
@@ -399,6 +417,16 @@ mod transaction_size_tests {
     #[test]
     fn rejects_empty_payloads() {
         assert!(validate_transaction_size(&[]).is_err());
+    }
+
+    #[test]
+    fn ghost_frame_adds_tip_outside_the_v1_limit() {
+        let mut transaction = vec![0u8; MAX_V1_TRANSACTION_SIZE];
+        transaction[0] = V1_TRANSACTION_PREFIX;
+        let frame = ghost_frame(42, &transaction);
+        assert_eq!(frame.len(), MAX_V1_TRANSACTION_SIZE + 8);
+        assert_eq!(&frame[..8], &42u64.to_le_bytes());
+        assert_eq!(&frame[8..], transaction);
     }
 }
 
