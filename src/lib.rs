@@ -14,8 +14,11 @@ use tracing::{info, warn};
 /// ALPN protocol identifier for Astralane TPU.
 const ALPN_ASTRALANE_TPU: &[u8] = b"astralane-tpu";
 
-/// Maximum Solana transaction size.
-pub const MAX_TRANSACTION_SIZE: usize = 1232;
+/// Maximum Solana transaction size: the v1 wire format's 4096 bytes
+/// (SIMD-0296/0385, `solana_message::v1::MAX_TRANSACTION_SIZE`). Legacy/v0
+/// transactions remain capped at 1232 by the network; the server enforces
+/// per-version limits, this is only the client-side upper bound.
+pub const MAX_TRANSACTION_SIZE: usize = 4096;
 
 /// QUIC application error codes returned by the server.
 pub mod error_code {
@@ -125,7 +128,7 @@ impl AstralaneQuicClient {
     /// There is no server response. Automatically reconnects if the connection is dead.
     ///
     /// # Arguments
-    /// * `transaction_bytes` - Bincode-serialized `VersionedTransaction` (max 1232 bytes)
+    /// * `transaction_bytes` - Wire-serialized `VersionedTransaction` (max 4096 bytes for v1, 1232 for legacy/v0)
     pub async fn send_transaction(&self, transaction_bytes: &[u8]) -> Result<()> {
         if transaction_bytes.len() > MAX_TRANSACTION_SIZE {
             anyhow::bail!(
