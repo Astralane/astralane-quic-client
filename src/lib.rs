@@ -14,8 +14,56 @@ use tracing::{info, warn};
 /// ALPN protocol identifier for Astralane TPU.
 const ALPN_ASTRALANE_TPU: &[u8] = b"astralane-tpu";
 
-/// Maximum Solana transaction size.
-pub const MAX_TRANSACTION_SIZE: usize = 1232;
+/// Maximum wire size for legacy and v0 Solana transactions.
+pub const MAX_LEGACY_TRANSACTION_SIZE: usize = 1232;
+
+/// Backward-compatible alias for the legacy/v0 transaction limit.
+pub const MAX_TRANSACTION_SIZE: usize = MAX_LEGACY_TRANSACTION_SIZE;
+
+/// Maximum wire size for Solana v1 transactions.
+pub const MAX_V1_TRANSACTION_SIZE: usize = 4096;
+
+// SIMD-0385: v1 transactions start with the version byte and carry signatures at the end.
+const V1_TRANSACTION_PREFIX: u8 = 0x81;
+
+/// Return the protocol size limit for an encoded transaction payload.
+#[must_use]
+pub fn transaction_size_limit(transaction_bytes: &[u8]) -> usize {
+    if transaction_bytes.first() == Some(&V1_TRANSACTION_PREFIX) {
+        MAX_V1_TRANSACTION_SIZE
+    } else {
+        MAX_LEGACY_TRANSACTION_SIZE
+    }
+}
+
+fn validate_transaction_size(transaction_bytes: &[u8]) -> Result<()> {
+    if transaction_bytes.is_empty() {
+        anyhow::bail!("Transaction payload is empty");
+    }
+
+    let max_size = transaction_size_limit(transaction_bytes);
+    if transaction_bytes.len() > max_size {
+        anyhow::bail!(
+            "Transaction too large: {} bytes (max {} for {})",
+            transaction_bytes.len(),
+            max_size,
+            if max_size == MAX_V1_TRANSACTION_SIZE {
+                "v1"
+            } else {
+                "legacy/v0"
+            }
+        );
+    }
+
+    Ok(())
+}
+
+fn ghost_frame(tip_lamports: u64, transaction_bytes: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(8 + transaction_bytes.len());
+    frame.extend_from_slice(&tip_lamports.to_le_bytes());
+    frame.extend_from_slice(transaction_bytes);
+    frame
+}
 
 /// QUIC application error codes returned by the server.
 pub mod error_code {
@@ -42,7 +90,7 @@ pub mod error_code {
 ///
 /// # async fn example() -> anyhow::Result<()> {
 /// let client = AstralaneQuicClient::connect("fra.astralane.io:9000", "your-api-key-uuid").await?;
-/// let tx_bytes: Vec<u8> = vec![]; // your bincode-serialized VersionedTransaction
+/// let tx_bytes: Vec<u8> = vec![]; // your Solana wire-encoded VersionedTransaction
 /// client.send_transaction(&tx_bytes).await?;
 /// # Ok(())
 /// # }
@@ -62,7 +110,6 @@ pub struct AstralaneQuicClient {
     endpoint: Endpoint,
     connection: Mutex<Connection>,
     server_addr: SocketAddr,
-    api_key: String,
     /// Client-level counter for reconnect attempts on error codes 1/2.
     /// Shared across all `send_transaction` calls. Resets on verified success.
     reconnect_attempts: AtomicU32,
@@ -78,7 +125,6 @@ impl AstralaneQuicClient {
     /// * `server_addr` - Server address in "host:port" format (e.g., "fra.astralane.io:9000")
     /// * `api_key` - Your API key UUID
     pub async fn connect(server_addr: &str, api_key: &str) -> Result<Self> {
-        
         let _ = rustls::crypto::ring::default_provider().install_default();
         let addr = SocketAddr::from_str(server_addr)
             .or_else(|_| {
@@ -92,7 +138,10 @@ impl AstralaneQuicClient {
             })
             .context("Invalid server address")?;
 
-        info!("[CLIENT] Building TLS config with api_key as CN: {}", api_key);
+        info!(
+            "[CLIENT] Building TLS config with api_key as CN: {}",
+            api_key
+        );
         let client_config = Self::build_client_config(api_key)?;
 
         let mut endpoint =
@@ -114,27 +163,37 @@ impl AstralaneQuicClient {
             endpoint,
             connection: Mutex::new(connection),
             server_addr: addr,
-            api_key: api_key.to_string(),
             reconnect_attempts: AtomicU32::new(0),
         })
     }
 
-    /// Send a single bincode-serialized `VersionedTransaction`.
+    /// Send a single wire-encoded `VersionedTransaction`.
     ///
     /// This is fire-and-forget: returns `Ok(())` when the bytes are written to the stream.
     /// There is no server response. Automatically reconnects if the connection is dead.
     ///
     /// # Arguments
-    /// * `transaction_bytes` - Bincode-serialized `VersionedTransaction` (max 1232 bytes)
+    /// * `transaction_bytes` - Solana wire bytes (1,232 bytes for legacy/v0; 4,096 for v1)
     pub async fn send_transaction(&self, transaction_bytes: &[u8]) -> Result<()> {
-        if transaction_bytes.len() > MAX_TRANSACTION_SIZE {
-            anyhow::bail!(
-                "Transaction too large: {} bytes (max {})",
-                transaction_bytes.len(),
-                MAX_TRANSACTION_SIZE
-            );
-        }
+        validate_transaction_size(transaction_bytes)?;
+        self.send_frame(transaction_bytes).await
+    }
 
+    /// Send a Ghost transaction frame with an out-of-band tip prefix.
+    ///
+    /// The transaction bytes are validated before the 8-byte little-endian tip is prepended, so
+    /// a v1 transaction may use the full 4,096-byte protocol limit.
+    pub async fn send_ghost_transaction(
+        &self,
+        tip_lamports: u64,
+        transaction_bytes: &[u8],
+    ) -> Result<()> {
+        validate_transaction_size(transaction_bytes)?;
+        let frame = ghost_frame(tip_lamports, transaction_bytes);
+        self.send_frame(&frame).await
+    }
+
+    async fn send_frame(&self, frame: &[u8]) -> Result<()> {
         // Get the current connection, reconnecting if dead
         let conn = {
             let mut guard = self.connection.lock().await;
@@ -200,7 +259,9 @@ impl AstralaneQuicClient {
                     self.reconnect_attempts.store(0, Ordering::Relaxed);
                     info!(
                         "[CLIENT] Reconnected to {} (attempt {}/{}, verified alive)",
-                        self.server_addr, attempts + 1, MAX_RECONNECT_ATTEMPTS
+                        self.server_addr,
+                        attempts + 1,
+                        MAX_RECONNECT_ATTEMPTS
                     );
                 } else {
                     // Error code 0 or non-ApplicationClosed: reconnect immediately
@@ -219,19 +280,19 @@ impl AstralaneQuicClient {
             guard.clone()
         };
 
-        info!("[CLIENT] Opening uni stream to send {} bytes", transaction_bytes.len());
+        info!("[CLIENT] Opening uni stream to send {} bytes", frame.len());
         let mut send_stream = conn
             .open_uni()
             .await
             .context("Failed to open unidirectional stream")?;
 
         send_stream
-            .write_all(transaction_bytes)
+            .write_all(frame)
             .await
             .context("Failed to write transaction data")?;
 
         send_stream.finish().context("Failed to finish stream")?;
-        info!("[CLIENT] Transaction sent ({} bytes)", transaction_bytes.len());
+        info!("[CLIENT] Transaction frame sent ({} bytes)", frame.len());
 
         Ok(())
     }
@@ -243,7 +304,10 @@ impl AstralaneQuicClient {
     pub async fn reconnect(&self) -> Result<()> {
         let mut guard = self.connection.lock().await;
         if guard.close_reason().is_some() {
-            info!("[CLIENT] Reconnecting to Astralane QUIC server at {}", self.server_addr);
+            info!(
+                "[CLIENT] Reconnecting to Astralane QUIC server at {}",
+                self.server_addr
+            );
             *guard = self
                 .endpoint
                 .connect(self.server_addr, "astralane")?
@@ -311,6 +375,58 @@ impl Drop for AstralaneQuicClient {
         self.connection
             .get_mut()
             .close(error_code::OK.into(), b"client closing");
+    }
+}
+
+#[cfg(test)]
+mod transaction_size_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_and_v0_keep_the_packet_data_limit() {
+        let mut at_limit = vec![0u8; MAX_LEGACY_TRANSACTION_SIZE];
+        at_limit[0] = 1; // compact signature count; v0 also starts with signatures
+        assert_eq!(
+            transaction_size_limit(&at_limit),
+            MAX_LEGACY_TRANSACTION_SIZE
+        );
+        assert!(validate_transaction_size(&at_limit).is_ok());
+
+        let mut over_limit = vec![0u8; MAX_LEGACY_TRANSACTION_SIZE + 1];
+        over_limit[0] = 1;
+        assert!(validate_transaction_size(&over_limit).is_err());
+    }
+
+    #[test]
+    fn v1_accepts_the_larger_protocol_boundary() {
+        for size in [MAX_LEGACY_TRANSACTION_SIZE + 1, MAX_V1_TRANSACTION_SIZE] {
+            let mut transaction = vec![0u8; size];
+            transaction[0] = V1_TRANSACTION_PREFIX;
+            assert_eq!(
+                transaction_size_limit(&transaction),
+                MAX_V1_TRANSACTION_SIZE
+            );
+            assert!(validate_transaction_size(&transaction).is_ok());
+        }
+
+        let mut over_limit = vec![0u8; MAX_V1_TRANSACTION_SIZE + 1];
+        over_limit[0] = V1_TRANSACTION_PREFIX;
+        assert!(validate_transaction_size(&over_limit).is_err());
+    }
+
+    #[test]
+    fn rejects_empty_payloads() {
+        assert!(validate_transaction_size(&[]).is_err());
+    }
+
+    #[test]
+    fn ghost_frame_adds_tip_outside_the_v1_limit() {
+        let mut transaction = vec![0u8; MAX_V1_TRANSACTION_SIZE];
+        transaction[0] = V1_TRANSACTION_PREFIX;
+        let frame = ghost_frame(42, &transaction);
+        assert_eq!(frame.len(), MAX_V1_TRANSACTION_SIZE + 8);
+        assert_eq!(&frame[..8], &42u64.to_le_bytes());
+        assert_eq!(&frame[8..], transaction);
     }
 }
 

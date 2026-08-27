@@ -49,9 +49,10 @@ async fn main() -> anyhow::Result<()> {
     let server = env::var("SERVER_ADDR").expect("SERVER_ADDR env var required");
     let rpc_url =
         env::var("RPC_URL").unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
-    let keypair_path =
-        env::var("KEYPAIR_PATH").expect("KEYPAIR_PATH env var required (path to Solana keypair JSON)");
-    let tip_address = env::var("TIP_ADDRESS").expect("TIP_ADDRESS env var required (Solana pubkey)");
+    let keypair_path = env::var("KEYPAIR_PATH")
+        .expect("KEYPAIR_PATH env var required (path to Solana keypair JSON)");
+    let tip_address =
+        env::var("TIP_ADDRESS").expect("TIP_ADDRESS env var required (Solana pubkey)");
 
     let tip_account = Pubkey::from_str(&tip_address)?;
 

@@ -31,6 +31,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Build your transaction
     let transaction: solana_sdk::transaction::VersionedTransaction = /* ... */;
+    // This example is legacy/v0. Use the Solana v1 wire codec for v1 transactions.
     let tx_bytes = bincode::serialize(&transaction)?;
 
     // Send (fire-and-forget)
@@ -50,7 +51,7 @@ Internally generates an EC P-256 self-signed certificate with `api_key` as the C
 
 **`client.send_transaction(&tx_bytes)`**
 
-Sends a bincode-serialized `VersionedTransaction` (max 1232 bytes). Opens a unidirectional QUIC stream, writes the bytes, and finishes the stream. Fire-and-forget  - returns `Ok(())` once written, with no server response.
+Sends a Solana wire-encoded `VersionedTransaction`. Legacy and v0 transactions are capped at 1232 bytes; v1 transactions are capped at 4096 bytes. Opens a unidirectional QUIC stream, writes the bytes, and finishes the stream. Fire-and-forget  - returns `Ok(())` once written, with no server response.
 
 **Automatic reconnection**: If the connection is dead (idle timeout, server restart, etc.), `send_transaction` will transparently reconnect before sending. No manual intervention needed.
 
@@ -80,7 +81,7 @@ client.close().await;
 | Max connections per API key| 10         |
 | Max streams per connection | 64         |
 | Stream timeout             | 750 ms     |
-| Max transaction size       | 1232 bytes |
+| Max transaction size       | 1232 bytes (legacy/v0), 4096 bytes (v1) |
 | Idle timeout               | 30 s       |
 
 ### Error Codes
