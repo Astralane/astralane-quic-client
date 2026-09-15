@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{ClientConfig, Connection, Endpoint, IdleTimeout, TransportConfig};
 use rcgen::{CertificateParams, KeyPair};
@@ -108,7 +109,8 @@ const RECONNECT_VERIFY_DELAY: Duration = Duration::from_millis(500);
 
 pub struct AstralaneQuicClient {
     endpoint: Endpoint,
-    connection: Mutex<Connection>,
+    connection: ArcSwap<Connection>,
+    reconnect_lock: Mutex<()>,
     server_addr: SocketAddr,
     /// Client-level counter for reconnect attempts on error codes 1/2.
     /// Shared across all `send_transaction` calls. Resets on verified success.
@@ -161,7 +163,8 @@ impl AstralaneQuicClient {
 
         Ok(Self {
             endpoint,
-            connection: Mutex::new(connection),
+            connection: ArcSwap::new(Arc::new(connection)),
+            reconnect_lock: Mutex::new(()),
             server_addr: addr,
             reconnect_attempts: AtomicU32::new(0),
         })
@@ -194,91 +197,7 @@ impl AstralaneQuicClient {
     }
 
     async fn send_frame(&self, frame: &[u8]) -> Result<()> {
-        // Get the current connection, reconnecting if dead
-        let conn = {
-            let mut guard = self.connection.lock().await;
-            if let Some(reason) = guard.close_reason() {
-                // Check if this is a recoverable application error
-                let recoverable_code =
-                    if let quinn::ConnectionError::ApplicationClosed(ref info) = reason {
-                        let code = info.error_code.into_inner();
-                        if code == error_code::UNKNOWN_API_KEY as u64
-                            || code == error_code::CONNECTION_LIMIT as u64
-                        {
-                            Some(code)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-
-                if let Some(code) = recoverable_code {
-                    // Client-level retry for error codes 1/2.
-                    // Counter is only incremented on confirmed server rejection,
-                    // not on network failures during reconnect.
-                    let attempts = self.reconnect_attempts.load(Ordering::Relaxed);
-                    if attempts >= MAX_RECONNECT_ATTEMPTS {
-                        anyhow::bail!(
-                            "Server closed connection: {} (code {}). All {} reconnect attempts exhausted.",
-                            error_code::describe(code as u32),
-                            code,
-                            MAX_RECONNECT_ATTEMPTS
-                        );
-                    }
-                    warn!(
-                        "[CLIENT] Server closed connection: {} (code {}), reconnect attempt {}/{}  in {}s...",
-                        error_code::describe(code as u32),
-                        code,
-                        attempts + 1,
-                        MAX_RECONNECT_ATTEMPTS,
-                        RECONNECT_DELAY.as_secs()
-                    );
-                    tokio::time::sleep(RECONNECT_DELAY).await;
-                    *guard = self
-                        .endpoint
-                        .connect(self.server_addr, "astralane")?
-                        .await
-                        .context("Failed to reconnect to Astralane QUIC server")?;
-
-                    // Wait briefly for server's post-handshake close frame to arrive
-                    tokio::time::sleep(RECONNECT_VERIFY_DELAY).await;
-                    if guard.close_reason().is_some() {
-                        // Server rejected again — increment counter
-                        let attempt = self.reconnect_attempts.fetch_add(1, Ordering::Relaxed) + 1;
-                        anyhow::bail!(
-                            "Server closed connection again after reconnect attempt {}/{}:  {} (code {})",
-                            attempt,
-                            MAX_RECONNECT_ATTEMPTS,
-                            error_code::describe(code as u32),
-                            code
-                        );
-                    }
-
-                    // Reconnect verified — reset counter
-                    self.reconnect_attempts.store(0, Ordering::Relaxed);
-                    info!(
-                        "[CLIENT] Reconnected to {} (attempt {}/{}, verified alive)",
-                        self.server_addr,
-                        attempts + 1,
-                        MAX_RECONNECT_ATTEMPTS
-                    );
-                } else {
-                    // Error code 0 or non-ApplicationClosed: reconnect immediately
-                    warn!(
-                        "[CLIENT] Connection dead, reconnecting to {} ...",
-                        self.server_addr
-                    );
-                    *guard = self
-                        .endpoint
-                        .connect(self.server_addr, "astralane")?
-                        .await
-                        .context("Failed to reconnect to Astralane QUIC server")?;
-                    info!("[CLIENT] Reconnected to {}", self.server_addr);
-                }
-            }
-            guard.clone()
-        };
+        let conn = self.get_or_create_connection().await?;
 
         info!("[CLIENT] Opening uni stream to send {} bytes", frame.len());
         let mut send_stream = conn
@@ -297,22 +216,124 @@ impl AstralaneQuicClient {
         Ok(())
     }
 
+    async fn get_or_create_connection(&self) -> Result<Arc<Connection>> {
+        let connection = self.connection.load_full();
+        if connection.close_reason().is_none() {
+            return Ok(connection);
+        }
+
+        let _reconnect_guard = self.reconnect_lock.lock().await;
+        let connection = self.connection.load_full();
+        let Some(reason) = connection.close_reason() else {
+            return Ok(connection);
+        };
+
+        // Check if this is a recoverable application error
+        let recoverable_code = if let quinn::ConnectionError::ApplicationClosed(ref info) = reason {
+            let code = info.error_code.into_inner();
+            if code == error_code::UNKNOWN_API_KEY as u64
+                || code == error_code::CONNECTION_LIMIT as u64
+            {
+                Some(code)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(code) = recoverable_code {
+            // Client-level retry for error codes 1/2.
+            // Counter is only incremented on confirmed server rejection,
+            // not on network failures during reconnect.
+            let attempts = self.reconnect_attempts.load(Ordering::Relaxed);
+            if attempts >= MAX_RECONNECT_ATTEMPTS {
+                anyhow::bail!(
+                    "Server closed connection: {} (code {}). All {} reconnect attempts exhausted.",
+                    error_code::describe(code as u32),
+                    code,
+                    MAX_RECONNECT_ATTEMPTS
+                );
+            }
+            warn!(
+                        "[CLIENT] Server closed connection: {} (code {}), reconnect attempt {}/{}  in {}s...",
+                        error_code::describe(code as u32),
+                        code,
+                        attempts + 1,
+                        MAX_RECONNECT_ATTEMPTS,
+                        RECONNECT_DELAY.as_secs()
+                    );
+            tokio::time::sleep(RECONNECT_DELAY).await;
+            let connection = Arc::new(
+                self.endpoint
+                    .connect(self.server_addr, "astralane")?
+                    .await
+                    .context("Failed to reconnect to Astralane QUIC server")?,
+            );
+
+            // Wait briefly for server's post-handshake close frame to arrive
+            tokio::time::sleep(RECONNECT_VERIFY_DELAY).await;
+            if connection.close_reason().is_some() {
+                // Server rejected again — increment counter
+                let attempt = self.reconnect_attempts.fetch_add(1, Ordering::Relaxed) + 1;
+                anyhow::bail!(
+                    "Server closed connection again after reconnect attempt {}/{}:  {} (code {})",
+                    attempt,
+                    MAX_RECONNECT_ATTEMPTS,
+                    error_code::describe(code as u32),
+                    code
+                );
+            }
+
+            // Reconnect verified — reset counter
+            self.reconnect_attempts.store(0, Ordering::Relaxed);
+            self.connection.store(connection.clone());
+            info!(
+                "[CLIENT] Reconnected to {} (attempt {}/{}, verified alive)",
+                self.server_addr,
+                attempts + 1,
+                MAX_RECONNECT_ATTEMPTS
+            );
+            Ok(connection)
+        } else {
+            // Error code 0 or non-ApplicationClosed: reconnect immediately
+            warn!(
+                "[CLIENT] Connection dead, reconnecting to {} ...",
+                self.server_addr
+            );
+            let connection = Arc::new(
+                self.endpoint
+                    .connect(self.server_addr, "astralane")?
+                    .await
+                    .context("Failed to reconnect to Astralane QUIC server")?,
+            );
+            self.connection.store(connection.clone());
+            info!("[CLIENT] Reconnected to {}", self.server_addr);
+            Ok(connection)
+        }
+    }
+
     /// Reconnect to the server if the connection was closed.
     ///
     /// Note: `send_transaction` automatically reconnects, so you typically
     /// don't need to call this manually.
     pub async fn reconnect(&self) -> Result<()> {
-        let mut guard = self.connection.lock().await;
-        if guard.close_reason().is_some() {
+        if self.connection.load().close_reason().is_some() {
+            let _reconnect_guard = self.reconnect_lock.lock().await;
+            if self.connection.load().close_reason().is_none() {
+                return Ok(());
+            }
             info!(
                 "[CLIENT] Reconnecting to Astralane QUIC server at {}",
                 self.server_addr
             );
-            *guard = self
-                .endpoint
-                .connect(self.server_addr, "astralane")?
-                .await
-                .context("Failed to reconnect to Astralane QUIC server")?;
+            let connection = Arc::new(
+                self.endpoint
+                    .connect(self.server_addr, "astralane")?
+                    .await
+                    .context("Failed to reconnect to Astralane QUIC server")?,
+            );
+            self.connection.store(connection);
             self.reconnect_attempts.store(0, Ordering::Relaxed);
             info!("[CLIENT] Reconnected to {}", self.server_addr);
         }
@@ -321,14 +342,14 @@ impl AstralaneQuicClient {
 
     /// Check if the connection is still alive.
     pub async fn is_connected(&self) -> bool {
-        self.connection.lock().await.close_reason().is_none()
+        self.connection.load().close_reason().is_none()
     }
 
     /// Close the connection gracefully.
     pub async fn close(&self) {
+        let _reconnect_guard = self.reconnect_lock.lock().await;
         self.connection
-            .lock()
-            .await
+            .load()
             .close(error_code::OK.into(), b"client closing");
     }
 
@@ -371,9 +392,8 @@ impl AstralaneQuicClient {
 
 impl Drop for AstralaneQuicClient {
     fn drop(&mut self) {
-        // get_mut() avoids async lock — safe in Drop since we have &mut self
         self.connection
-            .get_mut()
+            .load()
             .close(error_code::OK.into(), b"client closing");
     }
 }
