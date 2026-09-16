@@ -228,10 +228,7 @@ impl AstralaneQuicClient {
         .map_err(|error| ClientError::Endpoint(error.to_string()))?;
         endpoint.set_default_client_config(client_config);
 
-        let connection = Self::establish_connection(&endpoint, &config).await?;
-        if let Some(reason) = connection.close_reason() {
-            return Err(client_error_from_close_reason(&reason, 0));
-        }
+        let connection = Self::create_connection_with_retry(&endpoint, &config).await?;
         info!("[CLIENT] Connected to Astralane QUIC server");
 
         Ok(Self {
@@ -309,9 +306,13 @@ impl AstralaneQuicClient {
                 .await
                 .map_err(|error| ClientError::Write(error.to_string()))
         };
-        tokio::time::timeout(self.inner.config.stream_timeout, write)
-            .await
-            .map_err(|_| ClientError::StreamTimeout)??;
+        match tokio::time::timeout(self.inner.config.stream_timeout, write).await {
+            Ok(result) => result?,
+            Err(_) => {
+                let _ = send_stream.reset(0u32.into());
+                return Err(ClientError::StreamTimeout);
+            }
+        }
 
         send_stream
             .finish()
@@ -372,6 +373,7 @@ impl AstralaneQuicClient {
         if application_error_code(&reason) == Some(error_code::CONNECTION_LIMIT as u64) {
             let attempts = self.inner.reconnect_attempts.load(Ordering::Relaxed);
             if attempts >= self.inner.config.retry_policy.max_connection_limit_retries {
+                self.close_endpoint();
                 return Err(ClientError::ConnectionLimit { attempts });
             }
             warn!(
@@ -386,8 +388,7 @@ impl AstralaneQuicClient {
             warn!("[CLIENT] Connection dead, reconnecting");
         }
 
-        let connection =
-            Self::establish_connection(&self.inner.endpoint, &self.inner.config).await?;
+        let connection = Self::create_connection(&self.inner.endpoint, &self.inner.config).await?;
         self.ensure_open_or_close(&connection)?;
         let close_reason = connection.close_reason();
         self.inner.connection.store(connection.clone());
@@ -419,15 +420,7 @@ impl AstralaneQuicClient {
     }
 
     pub async fn shutdown(&self) -> Result<(), ClientError> {
-        let _reconnect_guard = self.inner.reconnect_lock.lock().await;
-        if self.inner.closed.swap(true, Ordering::AcqRel) {
-            return Ok(());
-        }
-
-        self.inner
-            .connection
-            .load()
-            .close(error_code::OK.into(), b"client closing");
+        self.close_endpoint();
         tokio::time::timeout(
             self.inner.config.shutdown_timeout,
             self.inner.endpoint.wait_idle(),
@@ -435,6 +428,13 @@ impl AstralaneQuicClient {
         .await
         .map_err(|_| ClientError::ShutdownTimeout)?;
         Ok(())
+    }
+
+    fn close_endpoint(&self) {
+        self.inner.closed.store(true, Ordering::Release);
+        self.inner
+            .endpoint
+            .close(error_code::OK.into(), b"client closing");
     }
 
     fn ensure_open(&self) -> Result<(), ClientError> {
@@ -454,7 +454,43 @@ impl AstralaneQuicClient {
         }
     }
 
-    async fn establish_connection(
+    async fn create_connection_with_retry(
+        endpoint: &Endpoint,
+        config: &AstralaneClientConfig,
+    ) -> Result<Arc<Connection>, ClientError> {
+        let maximum_retries = config.retry_policy.max_connection_limit_retries;
+
+        for attempt in 0..=maximum_retries {
+            let connection = Self::create_connection(endpoint, config).await?;
+            let Some(reason) = connection.close_reason() else {
+                return Ok(connection);
+            };
+
+            match application_error_code(&reason) {
+                Some(code) if code == error_code::UNKNOWN_API_KEY as u64 => {
+                    return Err(ClientError::UnknownApiKey);
+                }
+                Some(code) if code == error_code::CONNECTION_LIMIT as u64 => {
+                    if attempt == maximum_retries {
+                        return Err(ClientError::ConnectionLimit { attempts: attempt });
+                    }
+
+                    warn!(
+                        "[CLIENT] Connection limit reached, retry {}/{} in {}s",
+                        attempt + 1,
+                        maximum_retries,
+                        config.retry_policy.reconnect_delay.as_secs()
+                    );
+                    tokio::time::sleep(config.retry_policy.reconnect_delay).await;
+                }
+                _ => return Err(client_error_from_close_reason(&reason, attempt)),
+            }
+        }
+
+        unreachable!()
+    }
+
+    async fn create_connection(
         endpoint: &Endpoint,
         config: &AstralaneClientConfig,
     ) -> Result<Arc<Connection>, ClientError> {
@@ -484,6 +520,8 @@ impl AstralaneQuicClient {
             .map_err(|_| ClientError::ConnectTimeout)?
             .map_err(|error| ClientError::Connect(error.to_string()))?;
 
+        // The QUIC handshake can complete before the server's asynchronous authentication
+        // rejection arrives. Keep the connection private during this verification window.
         tokio::time::sleep(RECONNECT_VERIFY_DELAY).await;
         Ok(Arc::new(connection))
     }
