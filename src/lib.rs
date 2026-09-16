@@ -281,11 +281,30 @@ impl AstralaneQuicClient {
         };
 
         info!("[CLIENT] Opening uni stream to send {} bytes", frame.len());
-        let mut send_stream = conn
-            .open_uni()
-            .await
-            .context("Failed to open unidirectional stream")?;
 
+        let mut send_stream = match conn.open_uni().await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    warn!(
+                        "[CLIENT] open_uni failed ({}), reconnecting to {}...",
+                        e, self.server_addr
+                    );
+                    let mut guard = self.connection.lock().await;
+                    let new_conn = self
+                        .endpoint
+                        .connect(self.server_addr, "astralane")?
+                        .await
+                        .context("Failed to reconnect to Astralane QUIC server")?;
+                    *guard = new_conn.clone();
+                    self.reconnect_attempts.store(0, Ordering::Relaxed);
+                    new_conn
+                        .open_uni()
+                        .await
+                        .context("Failed to open unidirectional stream after reconnect")?
+                }
+        };
+
+        
         send_stream
             .write_all(frame)
             .await
