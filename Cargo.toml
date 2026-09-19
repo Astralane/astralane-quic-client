@@ -1,17 +1,19 @@
 [package]
 name = "astralane-quic-client"
 edition = "2021"
-version = "0.0.2"
+version = "1.0.0"
 
 [dependencies]
 quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rcgen = "0.13"
 tokio = { version = "1.42.0", features = ["rt-multi-thread", "net", "macros", "time"] }
-anyhow = "1.0.99"
+arc-swap = "1.7.1"
+thiserror = "2"
 tracing = "0.1.40"
 
 [dev-dependencies]
+anyhow = "1.0.99"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 solana-sdk = "3.0.0"
 solana-compute-budget-interface = "3.0.0"

@@ -4,7 +4,7 @@ Rust client library for sending Solana transactions to Astralane's QUIC TPU endp
 
 ### How It Works
 
-The client authenticates using a self-signed TLS certificate with your API key as the Common Name (CN). On connect, the server extracts the CN from the certificate to identify your account. Transactions are sent as fire-and-forget over QUIC unidirectional streams  - one stream per transaction.
+The client authenticates using a self-signed TLS certificate with your API key as the Common Name (CN). On connect, the server extracts the CN from the certificate to identify your account. Transactions are multiplexed over QUIC unidirectional streams, one stream per transaction.
 
 ### Installation
 
@@ -22,57 +22,59 @@ solana-sdk = "2"
 ### Quick Start
 
 ```rust
-use astralane_quic_client::AstralaneQuicClient;
+use astralane_quic_client::{
+    AstralaneClientConfig, AstralaneQuicClient, SendCompletion, ServerIdentity,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Connect (certificate is generated automatically from your API key)
-    let client = AstralaneQuicClient::connect("lim.gateway.astralane.io:7000", "your-api-key-uuid").await?;
+    let config = AstralaneClientConfig::new(
+        "lim.gateway.astralane.io:7000",
+        "your-api-key-uuid",
+        ServerIdentity::InsecureSkipVerification,
+    );
+    let client = AstralaneQuicClient::connect(config).await?;
 
     // Build your transaction
     let transaction: solana_sdk::transaction::VersionedTransaction = /* ... */;
     // This example is legacy/v0. Use the Solana v1 wire codec for v1 transactions.
     let tx_bytes = bincode::serialize(&transaction)?;
 
-    // Send (fire-and-forget)
-    client.send_transaction(&tx_bytes).await?;
+    client
+        .send_transaction_with_completion(&tx_bytes, SendCompletion::TransportAcknowledged)
+        .await?;
 
+    client.shutdown().await?;
     Ok(())
 }
 ```
 
 ### API
 
-**`AstralaneQuicClient::connect(server_addr, api_key)`**
+**`AstralaneQuicClient::connect(config)`**
 
-Connects to the QUIC server. Accepts both IP:port (`"1.2.3.4:7000"`) and hostname:port (`"lim.gateway.astralane.io:7000"`) formats.
+Connects using an `AstralaneClientConfig`. DNS resolution and connection establishment are bounded by `connect_timeout`; DNS is resolved again when reconnecting.
 
-Internally generates an EC P-256 self-signed certificate with `api_key` as the CN, configures ALPN as `astralane-tpu`, and establishes a single QUIC connection with 25s keep-alive. Each client instance holds exactly one connection  - all `send_transaction` calls are multiplexed as separate streams over it. Create multiple client instances if you need more concurrent connections (up to the server's per-API-key connection limit).
+The client generates an EC P-256 certificate with `api_key` as the CN and configures ALPN as `astralane-tpu`. The client is cheaply cloneable; all clones share one endpoint and connection. Use `PinnedCertificate` in production. `InsecureSkipVerification` must be selected explicitly and should only be used when the server certificate cannot be verified.
 
 **`client.send_transaction(&tx_bytes)`**
 
-Sends a Solana wire-encoded `VersionedTransaction`. Legacy and v0 transactions are capped at 1232 bytes; v1 transactions are capped at 4096 bytes. Opens a unidirectional QUIC stream, writes the bytes, and finishes the stream. Fire-and-forget  - returns `Ok(())` once written, with no server response.
+Sends a Solana wire-encoded `VersionedTransaction` and returns after the bytes and FIN are queued in Quinn. Legacy and v0 transactions are capped at 1232 bytes; v1 transactions are capped at 4096 bytes.
+
+**`client.send_transaction_with_completion(&tx_bytes, completion)`**
+
+Allows selecting `SendCompletion::Queued` or `SendCompletion::TransportAcknowledged`. Transport acknowledgment waits for the remote QUIC stack to acknowledge every byte. Neither mode confirms that Astralane processed or landed the transaction; that requires an application-level response.
 
 **Automatic reconnection**: If the connection is dead (idle timeout, server restart, etc.), `send_transaction` will transparently reconnect before sending. No manual intervention needed.
 
-**`client.reconnect().await`**
+**`client.is_connected()` / `client.is_closed()`**
 
-Manually reconnects if the connection was closed. Typically not needed since `send_transaction` reconnects automatically.
+Synchronous snapshots of the shared client state.
 
-**`client.is_connected().await`**
+**`client.shutdown().await`**
 
-Returns `true` if the connection is still alive.
-
-**`client.close().await`**
-
-Gracefully closes the connection. Also called automatically on drop.
-
-**Important:** `close()` sends a QUIC `CONNECTION_CLOSE` frame that immediately terminates all open streams. If you've just sent transactions, add a short delay before closing to let the server finish reading in-flight streams:
-
-```rust
-tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-client.close().await;
-```
+Permanently shuts down the shared client and waits, up to `shutdown_timeout`, for the endpoint to become idle. Calls made after shutdown return `ClientError::Closed`. Dropping the last client clone performs a best-effort non-blocking close.
 
 ### Current Server Limits
 
@@ -98,12 +100,11 @@ Use `astralane_quic_client::error_code::describe(code)` to get a human-readable 
 
 **Rate limiting**: When the rate limit is exceeded, the server silently drops excess transactions. The connection stays alive  - no error is returned to the client.
 
-**Stream limits**: When the concurrent stream limit is reached, `open_uni()` blocks (backpressure) until a stream slot frees up. The server does not close the connection  - `send_transaction` will simply take longer to return.
+**Stream limits**: When the concurrent stream limit is reached, `open_uni()` applies backpressure until a stream slot frees up. If that takes longer than `stream_timeout`, the send returns `ClientError::StreamTimeout`.
 
 ### Error Handling
 
 ```rust
-// send_transaction automatically reconnects if the connection is dead.
 match client.send_transaction(&tx_bytes).await {
     Ok(_) => println!("Sent!"),
     Err(e) => {

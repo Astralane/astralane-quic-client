@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
-use astralane_quic_client::AstralaneQuicClient;
+use astralane_quic_client::{
+    AstralaneClientConfig, AstralaneQuicClient, SendCompletion, ServerIdentity,
+};
 use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_sdk::hash::Hash;
 use solana_sdk::message::Message;
@@ -66,8 +68,10 @@ async fn main() -> anyhow::Result<()> {
     let recent_blockhash = fetch_recent_blockhash(&rpc_url).await?;
     info!("Recent blockhash: {}", recent_blockhash);
 
-    info!("Connecting to {} with API key {}...", server, api_key);
-    let client = AstralaneQuicClient::connect(&server, &api_key).await?;
+    info!("Connecting to {}...", server);
+    let config =
+        AstralaneClientConfig::new(server, api_key, ServerIdentity::InsecureSkipVerification);
+    let client = AstralaneQuicClient::connect(config).await?;
     info!("Connected!");
 
     // Build transaction instructions
@@ -89,14 +93,18 @@ async fn main() -> anyhow::Result<()> {
         tx_bytes.len()
     );
 
-    match client.send_transaction(&tx_bytes).await {
-        Ok(_) => info!("[CLIENT] Transaction sent successfully! sig={}", sig),
+    match client
+        .send_transaction_with_completion(&tx_bytes, SendCompletion::TransportAcknowledged)
+        .await
+    {
+        Ok(_) => info!(
+            "[CLIENT] Transaction acknowledged by the QUIC peer! sig={}",
+            sig
+        ),
         Err(e) => tracing::error!("[CLIENT] Failed to send transaction: {:?}", e),
     }
 
-    // Allow server to finish reading the stream before closing
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    client.close().await;
+    client.shutdown().await?;
     info!("Done!");
     Ok(())
 }
