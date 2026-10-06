@@ -85,7 +85,7 @@ async fn main() -> anyhow::Result<()> {
     let mut transaction = Transaction::new_unsigned(message);
     transaction.sign(&[&payer], recent_blockhash);
 
-    let tx_bytes = bincode::serialize(&transaction)?;
+    let tx_bytes = wincode::serialize(&transaction)?;
     let sig = transaction.signatures[0];
     info!(
         "[CLIENT] Sending transaction: sig={}, size={} bytes",

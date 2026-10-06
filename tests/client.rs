@@ -141,6 +141,118 @@ async fn transport_acknowledged_send_reaches_peer() -> Result<()> {
 }
 
 #[tokio::test]
+async fn signed_sdk5_transactions_reach_peer_unchanged() -> Result<()> {
+    use solana_sdk::hash::Hash;
+    use solana_sdk::instruction::Instruction;
+    use solana_sdk::message::{v0, v1, Message, VersionedMessage};
+    use solana_sdk::pubkey::Pubkey;
+    use solana_sdk::signature::{Keypair, Signer};
+    use solana_system_interface::instruction::transfer;
+    use solana_transaction::versioned::VersionedTransaction;
+
+    let (address, certificate, mut received, _) = spawn_server(None)?;
+    let client = connect_client(address, certificate).await?;
+    let payer = Keypair::new();
+    let blockhash = Hash::new_from_array([42; 32]);
+    let instructions = vec![transfer(&payer.pubkey(), &Pubkey::new_unique(), 100_000)];
+    let config = v1::TransactionConfig {
+        priority_fee: Some(200),
+        compute_unit_limit: Some(1_400_000),
+        loaded_accounts_data_size_limit: Some(1_048_576),
+        heap_size: None,
+    };
+    let mut messages = vec![
+        VersionedMessage::Legacy(Message::new_with_blockhash(
+            &instructions,
+            Some(&payer.pubkey()),
+            &blockhash,
+        )),
+        VersionedMessage::V0(v0::Message::try_compile(
+            &payer.pubkey(),
+            &instructions,
+            &[],
+            blockhash,
+        )?),
+        VersionedMessage::V1(v1::Message::try_compile_with_config(
+            &payer.pubkey(),
+            &instructions,
+            blockhash,
+            config,
+        )?),
+    ];
+
+    for target_size in [1_772, 4_096] {
+        let mut large_instructions = instructions.clone();
+        large_instructions.push(Instruction::new_with_bytes(
+            "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr".parse()?,
+            &vec![b'x'; 1_500],
+            vec![],
+        ));
+        let message = v1::Message::try_compile_with_config(
+            &payer.pubkey(),
+            &large_instructions,
+            blockhash,
+            config,
+        )?;
+        let transaction = VersionedTransaction::try_new(VersionedMessage::V1(message), &[&payer])?;
+        let initial_size = wincode::serialize(&transaction)?.len();
+        large_instructions[1]
+            .data
+            .resize(1_500 + target_size - initial_size, b'x');
+        messages.push(VersionedMessage::V1(v1::Message::try_compile_with_config(
+            &payer.pubkey(),
+            &large_instructions,
+            blockhash,
+            config,
+        )?));
+    }
+
+    for (index, message) in messages.into_iter().enumerate() {
+        let transaction = VersionedTransaction::try_new(message, &[&payer])?;
+        transaction.sanitize()?;
+        transaction.verify_and_hash_message()?;
+        let wire = wincode::serialize(&transaction)?;
+        if index >= 2 {
+            assert_eq!(wire[0], 0x81);
+        }
+        if index >= 3 {
+            assert_eq!(wire.len(), [1_772, 4_096][index - 3]);
+        }
+
+        for completion in [
+            SendCompletion::Queued,
+            SendCompletion::TransportAcknowledged,
+        ] {
+            client
+                .send_transaction_with_completion(&wire, completion)
+                .await?;
+            let frame = tokio::time::timeout(Duration::from_secs(2), received.recv())
+                .await?
+                .expect("server should receive the signed transaction");
+            assert_eq!(frame, wire);
+            let decoded: VersionedTransaction = wincode::deserialize(&frame)?;
+            assert_eq!(decoded, transaction);
+            decoded.verify_and_hash_message()?;
+        }
+
+        if wire.len() == 4_096 {
+            let mut oversized = wire;
+            oversized.push(0);
+            assert!(matches!(
+                client.send_transaction(&oversized).await,
+                Err(ClientError::TransactionTooLarge {
+                    actual: 4_097,
+                    maximum: 4_096,
+                    ..
+                })
+            ));
+        }
+    }
+    client.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn ghost_send_writes_tip_before_transaction() -> Result<()> {
     let (address, certificate, mut received, _) = spawn_server(None)?;
     let client = connect_client(address, certificate).await?;

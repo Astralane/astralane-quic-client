@@ -15,9 +15,14 @@ Add to your `Cargo.toml`:
 astralane-quic-client = { path = "../astralane-quic-client" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1"
-bincode = "1"
-solana-sdk = "2"
+wincode = "0.6.1"
+solana-sdk = "5.0.0"
+solana-transaction = { version = "5.0.0", features = ["wincode"] }
 ```
+
+The examples and compatibility tests use Solana SDK 5.0.0. The client itself accepts wire bytes and has no runtime Solana SDK dependency.
+
+For v1 transactions, set the compute unit limit and loaded accounts data size limit explicitly in `v1::TransactionConfig`. Its priority fee is a total in lamports. Serialize signed transactions with `wincode`; it supports legacy, v0, and v1 wire formats.
 
 ### Quick Start
 
@@ -38,8 +43,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Build your transaction
     let transaction: solana_sdk::transaction::VersionedTransaction = /* ... */;
-    // This example is legacy/v0. Use the Solana v1 wire codec for v1 transactions.
-    let tx_bytes = bincode::serialize(&transaction)?;
+    // wincode supports legacy, v0, and v1 transaction wire formats.
+    let tx_bytes = wincode::serialize(&transaction)?;
 
     client
         .send_transaction_with_completion(&tx_bytes, SendCompletion::TransportAcknowledged)
